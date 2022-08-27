@@ -657,7 +657,7 @@ def process_images(
         n_iter, steps, cfg_scale, width, height, prompt_matrix, use_GFPGAN, use_RealESRGAN,use_GoBIG, realesrgan_model_name,
         fp, ddim_eta=0.0, do_not_save_grid=False, normalize_prompt_weights=True, init_img=None, init_mask=None,
         keep_mask=False, mask_blur_strength=3, denoising_strength=0.75, resize_mode=None, uses_loopback=False,
-        uses_random_seed_loopback=False, sort_samples=True, write_info_files=True, jpg_sample=False,
+        uses_random_seed_loopback=False, sort_samples=True, write_info_files=True, jpg_sample=False, constant_seed=False,
         range_based_gen=False, rb_steps_start=16, rb_steps_end=48, rb_cfgs_start=7.0, rb_cfgs_end=11.0, rb_denoise_start=0.001, rb_denoise_end=0.001):
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
     assert prompt is not None
@@ -697,7 +697,11 @@ def process_images(
                 all_prompts.append(current)
 
             n_iter = math.ceil(len(all_prompts) / batch_size)
-            all_seeds = len(all_prompts) * [seed]
+            
+            if constant_seed:
+                all_seeds = [seed] * len(all_prompts)
+            else:
+                all_seeds = [seed + x for x in range(len(all_prompts))]
 
         print(f"Prompt matrix will create {len(all_prompts)} images using a total of {n_iter} batches.")
     else:
@@ -711,7 +715,10 @@ def process_images(
                 print(traceback.format_exc(), file=sys.stderr)
 
         all_prompts = batch_size * n_iter * [prompt]
-        all_seeds = [seed + x for x in range(len(all_prompts))]
+        if constant_seed:
+            all_seeds = [seed] * len(all_prompts)
+        else:
+            all_seeds = [seed + x for x in range(len(all_prompts))]
     
     if range_based_gen and not txt2img_range_based_valid(rb_steps_start, rb_steps_end, rb_cfgs_start, rb_cfgs_end, rb_denoise_start, rb_denoise_end):
         print(f"Range based generation parameters incorrect. Check your settings!")
@@ -1198,10 +1205,11 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
     sort_samples = 4 in toggles
     write_info_files = 5 in toggles
     jpg_sample = 6 in toggles
-    range_based_gen = 7 in toggles
-    use_GoBIG = 8 in toggles
-    use_GFPGAN = 9 in toggles
-    use_RealESRGAN = 9 in toggles if GFPGAN is None else 10 in toggles # possible index shift
+    constant_seed = 7 in toggles
+    range_based_gen = 8 in toggles
+    use_GoBIG = 9 in toggles
+    use_GFPGAN = 10 in toggles
+    use_RealESRGAN = 10 in toggles if GFPGAN is None else 11 in toggles # possible index shift
     
     if sampler_name == 'PLMS':
         sampler = PLMSSampler(model)
@@ -1265,6 +1273,7 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
             sort_samples=sort_samples,
             write_info_files=write_info_files,
             jpg_sample=jpg_sample,
+            constant_seed=constant_seed,
             range_based_gen=range_based_gen,
             rb_steps_start=rb_steps_start,
             rb_steps_end=rb_steps_end,
@@ -1355,10 +1364,11 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
     sort_samples = 6 in toggles
     write_info_files = 7 in toggles
     jpg_sample = 8 in toggles
-    range_based_gen = 9 in toggles
-    use_GoBIG = 10 in toggles
-    use_GFPGAN = 11 in toggles
-    use_RealESRGAN = 11 in toggles if GFPGAN is None else 12 in toggles # possible index shift
+    constant_seed = 9 in toggles
+    range_based_gen = 10 in toggles
+    use_GoBIG = 11 in toggles
+    use_GFPGAN = 12 in toggles
+    use_RealESRGAN = 12 in toggles if GFPGAN is None else 13 in toggles # possible index shift
 
     if sampler_name == 'DDIM':
         sampler = DDIMSampler(model)
@@ -1488,6 +1498,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                     sort_samples=sort_samples,
                     write_info_files=write_info_files,
                     jpg_sample=jpg_sample,
+                    constant_seed=constant_seed,
                     range_based_gen=range_based_gen,
                     rb_steps_start=rb_steps_start,
                     rb_steps_end=rb_steps_end,
@@ -1551,6 +1562,7 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                 sort_samples=sort_samples,
                 write_info_files=write_info_files,
                 jpg_sample=jpg_sample,
+                constant_seed=constant_seed,
                 range_based_gen=range_based_gen,
                 rb_steps_start=rb_steps_start,
                 rb_steps_end=rb_steps_end,
@@ -1882,7 +1894,8 @@ txt2img_toggles = [
     'Sort samples by prompt',
     'Write sample info files',
     'jpg samples',
-    'range based generation'
+    'Constant seed',
+    'Range based sampling'
 ]
 if RealESRGAN is not None:
     txt2img_toggles.append('Upscale images using goBig')
@@ -1932,6 +1945,7 @@ img2img_toggles = [
     'Sort samples by prompt',
     'Write sample info files',
     'jpg samples',
+    'Constant seed',
     'Range based sampling'
 ]
 if RealESRGAN is not None:
