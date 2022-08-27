@@ -518,7 +518,7 @@ def check_prompt_length(prompt, comments):
     comments.append(f"Warning: too many input tokens; some ({len(overflowing_words)}) have been truncated:\n{overflowing_text}\n")
 
 process_image_cancel_requested = False
-process_image_cancel_requested_lock = threading.Lock()
+process_image_running = False
 
 def save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
 normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
@@ -661,6 +661,7 @@ def process_images(
         range_based_gen=False, rb_steps_start=16, rb_steps_end=48, rb_cfgs_start=7.0, rb_cfgs_end=11.0, rb_denoise_start=0.001, rb_denoise_end=0.001):
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
     assert prompt is not None
+
     torch_gc()
     # start time after garbage collection (or before?)
     start_time = time.time()
@@ -726,11 +727,8 @@ def process_images(
 
         for n in range(n_iter):
             print(f"Iteration: {n+1}/{n_iter}")
-            global process_image_cancel_requested
-            global process_image_cancel_requested_lock
-            with process_image_cancel_requested_lock:
-                if process_image_cancel_requested:
-                    break
+            if is_cancel_generation_requested():
+                break
             
             prompts = all_prompts[n * batch_size:(n + 1) * batch_size]
             seeds = all_seeds[n * batch_size:(n + 1) * batch_size]
@@ -1231,11 +1229,16 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
         samples_ddim, _ = sampler.sample(S=steps, conditioning=conditioning, batch_size=int(x.shape[0]), shape=x[0].shape, verbose=False, unconditional_guidance_scale=cfgs, unconditional_conditioning=unconditional_conditioning, eta=ddim_eta, x_T=x)
         return samples_ddim
 
+    if is_generation_running():
+        return [], seed, "generation already running", []
+
     try:
         global process_image_cancel_requested
-        global process_image_cancel_requested_lock
-        with process_image_cancel_requested_lock:
-            process_image_cancel_requested = False
+        process_image_cancel_requested = False
+
+        global process_image_running
+        process_image_running = True
+        
         output_images, seed, info, stats = process_images(
             outpath=outpath,
             func_init=init,
@@ -1270,7 +1273,7 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
         )
 
         del sampler
-
+    
         return output_images, seed, info, stats
     except RuntimeError as e:
         err = e
@@ -1278,6 +1281,8 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
         stats = err_msg
         return [], seed, 'err', stats
     finally:
+        process_image_running = False
+
         if err:
             crash(err, '!!Runtime error (txt2img)!!')
 
@@ -1433,12 +1438,15 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                                             unconditional_conditioning=unconditional_conditioning,)
         return samples_ddim
 
+    if is_generation_running():
+        return [], seed, "generation already running", []
 
     try:
         global process_image_cancel_requested
-        global process_image_cancel_requested_lock
-        with process_image_cancel_requested_lock:
-            process_image_cancel_requested = False
+        process_image_cancel_requested = False
+
+        global process_image_running
+        process_image_running = True
 
         if loopback:
             output_images, info = None, None
@@ -1561,6 +1569,8 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
         stats = err_msg
         return [], seed, 'err', stats
     finally:
+        process_image_running = False
+
         if err:
             crash(err, '!!Runtime error (img2img)!!')
 
@@ -2007,12 +2017,17 @@ def show_help():
 def hide_help():
     return [gr.update(visible=True), gr.update(visible=False), gr.update(value="")]
 
+def is_generation_running():
+    global process_image_running
+    return process_image_running
+
 def cancel_process():
     global process_image_cancel_requested
-    global process_image_cancel_requested_lock
-    with process_image_cancel_requested_lock:
-        process_image_cancel_requested = True
-    
+    process_image_cancel_requested = True
+
+def is_cancel_generation_requested():
+    global process_image_cancel_requested
+    return process_image_cancel_requested
 
 
 css_hide_progressbar = """
@@ -2102,7 +2117,8 @@ with gr.Blocks(css=css, analytics_enabled=False, title="Stable Diffusion WebUI")
             )
             txt2img_prompt.submit(
                 txt2img,
-                [txt2img_prompt, txt2img_steps, txt2img_sampling, txt2img_toggles, txt2img_realesrgan_model_name, txt2img_ddim_eta, txt2img_batch_count, txt2img_batch_size, txt2img_cfg, txt2img_seed, txt2img_height, txt2img_width, txt2img_embeddings],
+                [txt2img_prompt, txt2img_steps, txt2img_sampling, txt2img_toggles, txt2img_realesrgan_model_name, txt2img_ddim_eta, txt2img_batch_count, txt2img_batch_size, txt2img_cfg, txt2img_seed, txt2img_height, txt2img_width, txt2img_embeddings,
+                    txt2img_rb_steps_start, txt2img_rb_steps_end, txt2img_rb_cfgs_start, txt2img_rb_cfgs_end],
                 [output_txt2img_gallery, output_txt2img_seed, output_txt2img_params, output_txt2img_stats]
             )
 
@@ -2317,8 +2333,7 @@ class ServerLauncher(threading.Thread):
             'server_name': '0.0.0.0', 
             'share': opt.share
         }
-        if not opt.share:
-            demo.queue(concurrency_count=2)
+
         if opt.share and opt.share_password:
             gradio_params['auth'] = ('webui', opt.share_password)    
         self.demo.launch(**gradio_params)
