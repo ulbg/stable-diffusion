@@ -660,6 +660,7 @@ def cancel_process():
 
 def is_cancel_generation_requested():
     global process_image_cancel_requested
+    return process_image_cancel_requested
 
 def process_images(
         outpath, func_init, func_sample, prompt, seed, sampler_name, skip_grid, skip_save, batch_size,
