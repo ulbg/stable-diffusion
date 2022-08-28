@@ -301,7 +301,7 @@ def try_loading_RealESRGAN(model_name: str):
 try_loading_RealESRGAN('RealESRGAN_x4plus')
 
 if opt.optimized:
-    sd = load_sd_from_config("models/ldm/stable-diffusion-v1/model.ckpt")
+    sd = load_sd_from_config(opt.ckpt)
     li, lo = [], []
     for key, v_ in sd.items():
         sp = key.split('.')
@@ -337,8 +337,8 @@ if opt.optimized:
     model = model if opt.no_half else model.half()
     modelCS = modelCS if opt.no_half else modelCS.half()
 else:
-    config = OmegaConf.load("configs/stable-diffusion/v1-inference.yaml")
-    model = load_model_from_config(config, "models/ldm/stable-diffusion-v1/model.ckpt")
+    config = OmegaConf.load(opt.config)
+    model = load_model_from_config(config, opt.ckpt)
 
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     model = (model if opt.no_half else model.half()).to(device)
@@ -516,9 +516,6 @@ def check_prompt_length(prompt, comments):
 
     comments.append(f"Warning: too many input tokens; some ({len(overflowing_words)}) have been truncated:\n{overflowing_text}\n")
 
-process_image_cancel_requested = False
-process_image_running = False
-
 def save_sample(image, sample_path_i, filename, jpg_sample, prompts, seeds, width, height, steps, cfg_scale, 
 normalize_prompt_weights, use_GFPGAN, write_info_files, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
 skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode):
@@ -648,8 +645,21 @@ def oxlamon_matrix(prompt, seed, batch_size):
     all_prompts, prompt_matrix_parts = classToArrays(getmatrix( prompt ))
     n_iter = math.ceil(len(all_prompts) / batch_size)
     all_seeds = len(all_prompts) * [seed]
-    return all_seeds, n_iter, prompt_matrix_parts, all_prompts
+    return all_seeds, n_iter, prompt_matrix_parts, all_prompts, None
 
+process_image_cancel_requested = False
+process_image_running = False
+
+def is_generation_running():
+    global process_image_running
+    return process_image_running
+
+def cancel_process():
+    global process_image_cancel_requested
+    process_image_cancel_requested = True
+
+def is_cancel_generation_requested():
+    global process_image_cancel_requested
 
 def process_images(
         outpath, func_init, func_sample, prompt, seed, sampler_name, skip_grid, skip_save, batch_size,
@@ -676,12 +686,15 @@ def process_images(
     sample_path = os.path.join(outpath, "samples")
     os.makedirs(sample_path, exist_ok=True)
 
+    if not ("|" in prompt) and prompt.startswith("@"):
+        prompt = prompt[1:]
+
     comments = []
 
     prompt_matrix_parts = []
     if prompt_matrix:
         if prompt.startswith("@"):
-            all_seeds, n_iter, prompt_matrix_parts, all_prompts = oxlamon_matrix(prompt, seed, batch_size)
+            all_seeds, n_iter, prompt_matrix_parts, all_prompts, frows = oxlamon_matrix(prompt, seed, batch_size)
         else:
             all_prompts = []
             prompt_matrix_parts = prompt.split("|")
@@ -696,7 +709,6 @@ def process_images(
                 all_prompts.append(current)
 
             n_iter = math.ceil(len(all_prompts) / batch_size)
-            
             if constant_seed:
                 all_seeds = [seed] * len(all_prompts)
             else:
@@ -714,6 +726,7 @@ def process_images(
                 print(traceback.format_exc(), file=sys.stderr)
 
         all_prompts = batch_size * n_iter * [prompt]
+        
         if constant_seed:
             all_seeds = [seed] * len(all_prompts)
         else:
@@ -734,8 +747,9 @@ def process_images(
         for n in range(n_iter):
             print(f"Iteration: {n+1}/{n_iter}")
             if is_cancel_generation_requested():
+                print("Stopping generation...")
                 break
-            
+
             prompts = all_prompts[n * batch_size:(n + 1) * batch_size]
             seeds = all_seeds[n * batch_size:(n + 1) * batch_size]
 
@@ -826,7 +840,6 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
                     torch_gc()
                     if RealESRGAN.model.name != realesrgan_model_name:
                         try_loading_RealESRGAN(realesrgan_model_name)
-
                     output, img_mode = RealESRGAN.enhance(x_sample[:,:,::-1])
                     esrgan_filename = original_filename + '-esrgan4x'
                     esrgan_sample = output[:,:,::-1]
@@ -889,21 +902,21 @@ Seed: {seeds[i]}, Steps: {curr_steps}, CFG scale: {format(curr_cfgs, '.3f')}"""
 
         if (prompt_matrix or not skip_grid) and not do_not_save_grid:
             if prompt_matrix:
-                grid = image_grid(output_images, batch_size, force_n_rows=1 << ((len(prompt_matrix_parts)-1)//2), captions=prompt_matrix_parts if prompt.startswith("@") else None)
-            else:
-                grid = image_grid(output_images, batch_size)
-
-            if prompt_matrix:
-                if not prompt.startswith("@"):
+                if prompt.startswith("@"):
+                    grid = image_grid(output_images, batch_size, force_n_rows=frows, captions=prompt_matrix_parts)
+                else:
+                    grid = image_grid(output_images, batch_size, force_n_rows=1 << ((len(prompt_matrix_parts)-1)//2))
                     try:
                         grid = draw_prompt_matrix(grid, width, height, prompt_matrix_parts)
                     except:
                         import traceback
                         print("Error creating prompt_matrix text:", file=sys.stderr)
                         print(traceback.format_exc(), file=sys.stderr)
-                output_images.insert(0, grid)
             else:
                 grid = image_grid(output_images, batch_size)
+ 
+            if grid:
+                output_images.insert(0, grid)
 
             grid_count = get_next_sequence_number(outpath, 'grid-')
             grid_file = f"grid-{grid_count:05}-{seed}_{prompts[i].replace(' ', '_').translate({ord(x): '' for x in invalid_filename_chars})[:128]}.{grid_ext}"
@@ -968,9 +981,7 @@ def str_to_float_or_val(s, dval):
 def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int], realesrgan_model_name: str,
             ddim_eta: float, n_iter: int, batch_size: int, cfg_scale: float, seed: Union[int, str, None],
             height: int, width: int, fp,
-            rb_steps_start: Union[int, str, None], rb_steps_end:Union[int, str, None], rb_cfgs_start:Union[float, str, None], rb_cfgs_end:Union[float, str, None],
-            **kwargs):
-    
+            rb_steps_start: Union[int, str, None], rb_steps_end:Union[int, str, None], rb_cfgs_start:Union[float, str, None], rb_cfgs_end:Union[float, str, None]):
     
     outpath = opt.outdir_txt2img or opt.outdir or "outputs/txt2img-samples"
     err = False
@@ -1020,16 +1031,13 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
         samples_ddim, _ = sampler.sample(S=steps, conditioning=conditioning, batch_size=int(x.shape[0]), shape=x[0].shape, verbose=False, unconditional_guidance_scale=cfgs, unconditional_conditioning=unconditional_conditioning, eta=ddim_eta, x_T=x)
         return samples_ddim
 
-    if is_generation_running():
-        return [], seed, "generation already running", []
-
     try:
         global process_image_cancel_requested
         process_image_cancel_requested = False
 
         global process_image_running
         process_image_running = True
-        
+
         output_images, seed, info, stats = process_images(
             outpath=outpath,
             func_init=init,
@@ -1073,7 +1081,6 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
         return [], seed, 'err', stats
     finally:
         process_image_running = False
-
         if err:
             crash(err, '!!Runtime error (txt2img)!!')
 
@@ -1229,9 +1236,6 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
                                             unconditional_conditioning=unconditional_conditioning,)
         return samples_ddim
 
-    if is_generation_running():
-        return [], seed, "generation already running", []
-
     try:
         global process_image_cancel_requested
         process_image_cancel_requested = False
@@ -1361,7 +1365,6 @@ def img2img(prompt: str, image_editor_mode: str, init_info, mask_mode: str, mask
         return [], seed, 'err', stats
     finally:
         process_image_running = False
-
         if err:
             crash(err, '!!Runtime error (img2img)!!')
 
@@ -1455,7 +1458,7 @@ txt2img_toggles = [
     'Write sample info files',
     'jpg samples',
     'Constant seed',
-    'Range based sampling'
+    'Range based sampling',
 ]
 if GFPGAN is not None:
     txt2img_toggles.append('Fix faces using GFPGAN')
@@ -1538,6 +1541,12 @@ img2img_defaults = {
     'height': 512,
     'width': 512,
     'fp': None,
+    'rb_steps_start': 16,
+    'rb_steps_end': 48,
+    'rb_cfgs_start': 7.0,
+    'rb_cfgs_end': 11.0,
+    'rb_denoise_start': 0.3,
+    'rb_denoise_end': 0.7,
 }
 
 if 'img2img' in user_defaults:
@@ -1594,19 +1603,6 @@ def show_help():
 
 def hide_help():
     return [gr.update(visible=True), gr.update(visible=False), gr.update(value="")]
-
-def is_generation_running():
-    global process_image_running
-    return process_image_running
-
-def cancel_process():
-    global process_image_cancel_requested
-    process_image_cancel_requested = True
-
-def is_cancel_generation_requested():
-    global process_image_cancel_requested
-    return process_image_cancel_requested
-
 
 css_hide_progressbar = """
 .wrap .m-12 svg { display:none!important; }
@@ -1751,19 +1747,19 @@ with gr.Blocks(css=css, analytics_enabled=False, title="Stable Diffusion WebUI")
                     img2img_denoising = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, label='Denoising Strength', value=img2img_defaults['denoising_strength'])
                     img2img_seed = gr.Textbox(label="Seed (blank to randomize)", lines=1, value=img2img_defaults["seed"])
                     with gr.Row():
-                        img2img_rb_steps_start = gr.Textbox(label='RB: step start', lines=1, value=txt2img_defaults["rb_steps_start"])
-                        img2img_rb_steps_end = gr.Textbox(label='RB: step end', lines=1, value=txt2img_defaults["rb_steps_end"])
+                        img2img_rb_steps_start = gr.Textbox(label='RB: step start', lines=1, value=img2img_defaults["rb_steps_start"])
+                        img2img_rb_steps_end = gr.Textbox(label='RB: step end', lines=1, value=img2img_defaults["rb_steps_end"])
                     with gr.Row():
-                        img2img_rb_cfgs_start = gr.Textbox(label='RB: cfgs start', lines=1, value=txt2img_defaults["rb_cfgs_start"])
-                        img2img_rb_cfgs_end = gr.Textbox(label='RB: cfgs end', lines=1, value=txt2img_defaults["rb_cfgs_end"])
+                        img2img_rb_cfgs_start = gr.Textbox(label='RB: cfgs start', lines=1, value=img2img_defaults["rb_cfgs_start"])
+                        img2img_rb_cfgs_end = gr.Textbox(label='RB: cfgs end', lines=1, value=img2img_defaults["rb_cfgs_end"])
                     with gr.Row():
-                        img2img_rb_denoise_start = gr.Textbox(label='RB: denoise start', lines=1, value=txt2img_defaults["rb_denoise_start"])
-                        img2img_rb_denoise_end = gr.Textbox(label='RB: denoise end', lines=1, value=txt2img_defaults["rb_denoise_end"])
+                        img2img_rb_denoise_start = gr.Textbox(label='RB: denoise start', lines=1, value=img2img_defaults["rb_denoise_start"])
+                        img2img_rb_denoise_end = gr.Textbox(label='RB: denoise end', lines=1, value=img2img_defaults["rb_denoise_end"])
                     img2img_height = gr.Slider(minimum=64, maximum=2048, step=64, label="Height", value=img2img_defaults["height"])
                     img2img_width = gr.Slider(minimum=64, maximum=2048, step=64, label="Width", value=img2img_defaults["width"])
                     img2img_resize = gr.Radio(label="Resize mode", choices=["Just resize", "Crop and resize", "Resize and fill"], type="index", value=img2img_resize_modes[img2img_defaults['resize_mode']])
                     img2img_embeddings = gr.File(label = "Embeddings file for textual inversion", visible=hasattr(model, "embedding_manager"))
-                
+                    
                 with gr.Column():
                     output_img2img_gallery = gr.Gallery(label="Images")
                     output_img2img_select_image = gr.Number(label='Select image number from results for copying', value=1, precision=None)
@@ -1889,6 +1885,13 @@ with gr.Blocks(css=css, analytics_enabled=False, title="Stable Diffusion WebUI")
                     [realesrgan_source, realesrgan_model_name],
                     [realesrgan_output]
                 )
+    gr.HTML("""
+    <div id="90" style="max-width: 100%; font-size: 14px; text-align: center;" class="output-markdown gr-prose border-solid border border-gray-200 rounded gr-panel">
+        <p>For help and advanced usage guides, visit the <a href="https://github.com/hlky/stable-diffusion-webui/wiki" target="_blank">Project Wiki</a></p>
+        <p>Stable Diffusion WebUI is an open-source project. You can find the latest stable builds on the <a href="https://github.com/hlky/stable-diffusion" target="_blank">main repository</a>.
+        If you would like to contribute to developement or test bleeding edge builds, you can visit the <a href="https://github.com/hlky/stable-diffusion-webui" target="_blank">developement repository</a>.</p>
+    </div>
+    """)
 
 class ServerLauncher(threading.Thread):
     def __init__(self, demo):
